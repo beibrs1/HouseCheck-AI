@@ -9,3 +9,5 @@ dist/
 
 .pyinstaller-cache/
 
+data/outbox/
+data/reports/

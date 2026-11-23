@@ -11,13 +11,13 @@ QToolTip {
     padding: 6px 10px; font-size: 12px;
 }
 
-QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QComboBox {
+QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDateEdit, QComboBox {
     background: @field@; color: @text@; border: 1.5px solid @border@;
     border-radius: 14px; padding: 9px 14px; selection-background-color: @accent@; font-size: 13px;
     selection-color: #FFFFFF;
 }
-QLineEdit:hover, QPlainTextEdit:hover, QSpinBox:hover, QComboBox:hover { border-color: @border_strong@; }
-QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QSpinBox:focus, QComboBox:focus { border-color: @accent@; }
+QLineEdit:hover, QPlainTextEdit:hover, QSpinBox:hover, QDateEdit:hover, QComboBox:hover { border-color: @border_strong@; }
+QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QSpinBox:focus, QDateEdit:focus, QComboBox:focus { border-color: @accent@; }
 QLineEdit:read-only { background: @surface_muted@; color: @text_muted@; }
 QLineEdit#bare { border: none; background: transparent; padding: 0; font-size: 14px; }
 
@@ -85,3 +85,10 @@ QListWidget#palette::item:selected, QListWidget#palette::item:hover { background
 QPlainTextEdit#note { background: @surface_muted@; border: 1.5px solid @border@; border-radius: 16px; padding: 12px; font-size: 13px; }
 QPlainTextEdit#note:focus { border-color: @accent@; }
 QLineEdit#chatInput { border: none; background: transparent; padding: 0 6px; font-size: 14px; }
+
+QDateEdit { padding-right: 34px; }
+QDateEdit::drop-down { border: none; width: 30px; subcontrol-origin: padding; subcontrol-position: center right; }
+QDateEdit::down-arrow { image: url("@assets@/chevron.svg"); width: 12px; height: 12px; }
+QCalendarWidget QWidget { background: @surface@; color: @text@; }
+QCalendarWidget QToolButton { color: @text@; background: transparent; font-weight: 700; padding: 4px 8px; }
+QCalendarWidget QAbstractItemView:enabled { selection-background-color: @accent@; selection-color: #FFFFFF; }

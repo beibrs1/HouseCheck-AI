@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 
 import icons
 from analyzer import AnalysisResult
+from features import FeaturePages, ForgotPasswordDialog, RegisterDialog, SessionGuard
 from assistant_engine import CATS, ClaudeEngine, LocalEngine, personal_score
 from astana_map import AstanaMap
 from database import Database
@@ -93,21 +94,41 @@ class LoginDialog(QDialog):
         self.password.returnPressed.connect(self.try_login)
         self.username.returnPressed.connect(self.password.setFocus)
         rl.addWidget(login)
-        rl.addSpacing(8)
+        links = QHBoxLayout(); links.setSpacing(4)
+        reg = Button(tr("register", lang), "ghost", "user", "sm"); reg.clicked.connect(self.open_register)
+        forgot = Button(tr("forgot", lang), "ghost", "lock", "sm"); forgot.clicked.connect(self.open_forgot)
+        links.addWidget(reg); links.addStretch(); links.addWidget(forgot)
+        rl.addLayout(links)
         rl.addWidget(label(tr("first_login", lang), 12, "text_soft"))
         rl.addStretch()
         root.addWidget(right, 1)
         self.form = right
         QTimer.singleShot(0, self.password.setFocus)
 
+    def open_register(self):
+        d = RegisterDialog(self.db, self)
+        if d.exec() == QDialog.DialogCode.Accepted and d.user:
+            self.user = d.user
+            self.db.log(d.user, "Вход", d.user["username"], "Вход после регистрации")
+            self.accept()
+
+    def open_forgot(self):
+        login = self.username.text().strip()
+        if ForgotPasswordDialog(self.db, login if "@" in login else "", self).exec() == QDialog.DialogCode.Accepted:
+            self.password.clear(); self.password.setFocus()
+
     def try_login(self):
+        if not self.username.text().strip() or not self.password.text():
+            self.error.setText(tr("login_empty", self.lang)); self._shake(); return
         user = self.db.authenticate(self.username.text(), self.password.text())
         if not user:
+            self.db.log({"username": self.username.text().strip()}, "Неудачный вход", self.username.text().strip(), "Неверный логин или пароль")
             self.error.setText(tr("login_error", self.lang))
             self.mascot.set_mood("think")
             self._shake()
             return
         self.user = user
+        self.db.log(user, "Вход", user["username"], "Успешный вход")
         self.mascot.set_mood("happy")
         self.accept()
 
@@ -526,8 +547,10 @@ class Palette(QWidget):
 
 # ───────────────────────── Main window ─────────────────────────
 
-class HouseCheckWindow(QMainWindow):
-    NAV = [("home", "home"), ("catalog", "grid"), ("map", "map"), ("favorites", "heart"), ("compare", "compare"), ("comfort", "sliders"), ("assistant", "sparkle")]
+class HouseCheckWindow(FeaturePages, QMainWindow):
+    NAV = [("home", "home"), ("catalog", "grid"), ("map", "map"), ("favorites", "heart"), ("compare", "compare"), ("comfort", "sliders"), ("analytics", "chart"), ("assistant", "sparkle")]
+    CAT_NAMES = CAT_NAMES
+    logged_out = Signal()
 
     def __init__(self, db: Database | None = None, user: dict | None = None, language: str = "ru"):
         super().__init__()
@@ -538,7 +561,11 @@ class HouseCheckWindow(QMainWindow):
         self.local_ai = LocalEngine(self.db); self.claude = ClaudeEngine()
         self._palette = None; self._google_thread = None; self._google_worker = None; self._claude_thread = None
         self.setWindowTitle("HouseCheck AI"); self.resize(1480, 940); self.setMinimumSize(1180, 760)
+        self._logging_out = False
         self.build_ui()
+        self.guard = SessionGuard(self)
+        self._search_log_timer = QTimer(self); self._search_log_timer.setSingleShot(True); self._search_log_timer.setInterval(1500)
+        self._search_log_timer.timeout.connect(self._log_search)
         QShortcut(QKeySequence("Ctrl+K"), self, activated=self.open_palette)
         QShortcut(QKeySequence("Ctrl+F"), self, activated=self.open_palette)
 
@@ -573,7 +600,7 @@ class HouseCheckWindow(QMainWindow):
         self.setCentralWidget(root)
         if old:
             old.deleteLater()
-        for builder in [self.build_home, self.build_catalog, self.build_detail, self.build_map, self.build_favorites, self.build_compare, self.build_comfort, self.build_assistant, self.build_reviews, self.build_admin]:
+        for builder in [self.build_home, self.build_catalog, self.build_detail, self.build_map, self.build_favorites, self.build_compare, self.build_comfort, self.build_assistant, self.build_reviews, self.build_admin, self.build_analytics, self.build_history, self.build_profile]:
             builder()
         self.domi = FloatingDomi(self.t("ask_me"), self.area); self.domi.clicked.connect(lambda: self.show_page("assistant"))
         self.area.installEventFilter(self)
@@ -614,6 +641,8 @@ class HouseCheckWindow(QMainWindow):
         l.addSpacing(16)
         l.addWidget(label(self.t("sec_data"), 10, "nav_muted", 800)); l.addSpacing(4)
         b = NavButton(self.t("nav_reviews"), "chat"); b.clicked.connect(lambda: self.show_page("reviews")); self.nav["reviews"] = b; l.addWidget(b)
+        b = NavButton(self.t("nav_history"), "history"); b.clicked.connect(lambda: self.show_page("history")); self.nav["history"] = b; l.addWidget(b)
+        b = NavButton(self.t("nav_profile"), "user"); b.clicked.connect(lambda: self.show_page("profile")); self.nav["profile"] = b; l.addWidget(b)
         if self.user.get("role") == "super_admin":
             admin = NavButton(self.t("nav_admin"), "settings"); admin.clicked.connect(lambda: self.show_page("admin")); self.nav["admin"] = admin; l.addWidget(admin)
         l.addStretch()
@@ -622,7 +651,13 @@ class HouseCheckWindow(QMainWindow):
         promo.layout_().addLayout(hbox(vbox(label(self.t("promo_title"), 13, "#FFFFFF", 800), label(self.t("promo_sub"), 11, "#FFF3E8", 500), spacing=2), None, m, spacing=6))
         l.addWidget(promo)
         l.addSpacing(8)
-        l.addWidget(label(self.t("sidebar_note"), 10, "nav_muted"))
+        note = label(self.t("sidebar_note"), 10, "nav_muted"); l.addWidget(note)
+
+        def fit(e, base=Sidebar.resizeEvent):
+            # в невысоком окне прячем промо-карточку, чтобы пункты меню не сжимались
+            promo.setVisible(e.size().height() >= 900); note.setVisible(e.size().height() >= 800)
+            base(s, e)
+        s.resizeEvent = fit
         return s
 
     def top_bar(self):
@@ -646,11 +681,13 @@ class HouseCheckWindow(QMainWindow):
         l.addWidget(self.language_select)
         l.addSpacing(6)
         user_box = QFrame(); ul = QHBoxLayout(user_box); ul.setContentsMargins(0, 0, 0, 0); ul.setSpacing(10)
-        ul.addWidget(Avatar(self.user.get("username", "user").replace("_", " "), 40))
-        ul.addLayout(vbox(label(self.user.get("username", "user"), 13, "text", 700, False), label(self.user.get("role", "viewer"), 11, "text_muted", 600, False), spacing=0))
+        ul.addWidget(Avatar(self.user.get("full_name") or self.user.get("username", "user").replace("_", " "), 40))
+        ul.addLayout(vbox(label(self.user.get("full_name") or self.user.get("username", "user"), 13, "text", 700, False), label(self.user.get("role", "viewer"), 11, "text_muted", 600, False), spacing=0))
         self.role_label = user_box
+        user_box.setCursor(Qt.PointingHandCursor); user_box.setToolTip(self.t("nav_profile"))
+        user_box.mousePressEvent = lambda e: self.show_page("profile")
         l.addWidget(user_box)
-        logout = IconButton("logout", self.t("logout"), "ghost"); logout.clicked.connect(self.close); l.addWidget(logout)
+        logout = IconButton("logout", self.t("logout"), "ghost"); logout.clicked.connect(lambda: self.logout()); l.addWidget(logout)
         return bar
 
     def open_palette(self):
@@ -813,7 +850,7 @@ class HouseCheckWindow(QMainWindow):
         self.add_button = Button(self.t("add"), "primary", "plus"); self.add_button.clicked.connect(self.add_development); h.addWidget(self.add_button)
         bar = Card("surface", 24, hover=False); bar.set_padding(14, 12, 14, 12)
         self.search = SearchBox(self.t("search_ph"), "", 46)
-        self.search.edit.textChanged.connect(lambda _: self._catalog_timer.start())
+        self.search.edit.textChanged.connect(lambda _: (self._catalog_timer.start(), self._search_log_timer.start()))
         self._catalog_timer = QTimer(self); self._catalog_timer.setSingleShot(True); self._catalog_timer.setInterval(160); self._catalog_timer.timeout.connect(self.refresh_catalog)
         self.price_switch = Segmented([self.t("buy"), self.t("rent")], self.price_mode)
         self.price_switch.changed.connect(lambda i: (setattr(self, "price_mode", i), self.refresh_catalog()))
@@ -853,6 +890,14 @@ class HouseCheckWindow(QMainWindow):
         outer.installEventFilter(self)
         self._tray_parent = outer
         outer.resizeEvent = lambda e, o=outer: self._place_tray()
+
+    def _log_search(self):
+        try:
+            q = self.search.edit.text().strip()
+        except (RuntimeError, AttributeError):
+            return
+        if len(q) >= 2:
+            self.log("Поиск", q, self.found_label.text())
 
     def _place_tray(self):
         if hasattr(self, "tray"):
@@ -992,6 +1037,8 @@ class HouseCheckWindow(QMainWindow):
         crow.addStretch(); pc.layout_().addLayout(crow)
         self.pros, self.cons = pc, pc
         left.addWidget(pc); fade_in(pc, 200)
+        if reviews:
+            ai = self.ai_explanation_card(reviews, result); left.addWidget(ai); fade_in(ai, 230)
         info = Card("surface", 26, hover=False); info.set_padding(22, 18, 22, 18)
         info.layout_().addWidget(label(self.t("about"), 17, "text", 800))
         g = QGridLayout(); g.setHorizontalSpacing(16); g.setVerticalSpacing(14)
@@ -1342,6 +1389,7 @@ class HouseCheckWindow(QMainWindow):
         for m in (self.head_mascot, self.side_mascot): m.set_mood("think")
         self.chat_status.setText(self.t("thinking"))
         local = self.local_ai.answer(text, self.db.preferences(), self.language)
+        self.log("Вопрос Доми", text, local["text"][:600])
         if self.claude.available:
             history = [{"role": "user" if m["mine"] else "assistant", "content": m["text"]} for m in self.chat]
             while history and history[0]["role"] != "user":
@@ -1526,7 +1574,8 @@ class HouseCheckWindow(QMainWindow):
     def refresh_page(self, key: str):
         {"home": self.refresh_home, "catalog": self.refresh_catalog, "detail": self.render_detail, "map": self.refresh_map,
          "favorites": self.refresh_favorites, "compare": self.refresh_compare, "comfort": self.refresh_live_top,
-         "assistant": self.refresh_assistant, "reviews": self.refresh_reviews, "admin": self.refresh_users}.get(key, lambda: None)()
+         "assistant": self.refresh_assistant, "reviews": self.refresh_reviews, "admin": self.refresh_users,
+         "analytics": self.refresh_analytics, "history": self.refresh_history, "profile": self.refresh_profile}.get(key, lambda: None)()
 
     # ---------- users (логика сохранена) ----------
     def refresh_users(self):
@@ -1585,7 +1634,7 @@ class HouseCheckWindow(QMainWindow):
         d = DevelopmentDialog(self)
         if d.exec() == QDialog.DialogCode.Accepted:
             try:
-                self.db.add_development(d.values(), "manual"); toast(self, "ЖК добавлен", "ok")
+                self.db.add_development(d.values(), "manual"); toast(self, "ЖК добавлен", "ok"); self.log("Добавление ЖК", d.values()["name"], "Сохранено")
             except ValueError as error:
                 QMessageBox.warning(self, "Не удалось добавить", str(error))
             self.refresh_all()
@@ -1598,13 +1647,19 @@ class HouseCheckWindow(QMainWindow):
         item = self.db.get_development(development_id)
         if not item: return
         d = DevelopmentDialog(self, item)
-        if d.exec() == QDialog.DialogCode.Accepted: self.db.update_development(development_id, d.values()); self.current_id = development_id; self.refresh_all(); toast(self, self.t("saved"), "ok")
+        if d.exec() == QDialog.DialogCode.Accepted:
+            try:
+                self.db.update_development(development_id, d.values())
+            except ValueError as error:
+                QMessageBox.warning(self, "Проверьте данные", str(error)); return
+            self.log("Изменение ЖК", d.values()["name"], "Сохранено")
+            self.current_id = development_id; self.refresh_all(); toast(self, self.t("saved"), "ok")
 
     def delete_development(self, development_id: int):
         if not self.require_permission("manage"): return
         item = self.db.get_development(development_id)
         if item and QMessageBox.question(self, "Удалить ЖК?", f"Удалить «{item['name']}» и отзывы?", QMessageBox.Yes | QMessageBox.No) == QMessageBox.Yes:
-            self.db.delete_development(development_id); self.compare_ids.discard(development_id)
+            self.db.delete_development(development_id); self.compare_ids.discard(development_id); self.log("Удаление ЖК", item["name"], "Удалён вместе с отзывами")
             if self.current_id == development_id: self.current_id = None
             self.show_page("catalog"); toast(self, "ЖК удалён", "ok")
 
@@ -1622,7 +1677,10 @@ class HouseCheckWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(self, "Импорт разрешённого экспорта", "", "HouseCheck data (*.json *.csv)")
         if not path: return
         try:
-            developments, reviews = self.db.import_file(Path(path)); self.refresh_all(); QMessageBox.information(self, "Импорт завершён", f"Добавлено ЖК: {developments}\nДобавлено отзывов: {reviews}")
+            developments, reviews = self.db.import_file(Path(path)); self.refresh_all()
+            skipped = getattr(self.db, "last_import_errors", [])
+            self.log("Импорт", Path(path).name, f"ЖК: {developments}, отзывов: {reviews}, пропущено: {len(skipped)}")
+            QMessageBox.information(self, "Импорт завершён", f"Добавлено ЖК: {developments}\nДобавлено отзывов: {reviews}" + (f"\n\nПропущено записей с ошибками: {len(skipped)}\n" + "\n".join("• " + e for e in skipped[:10]) if skipped else ""))
         except Exception as error: QMessageBox.critical(self, "Ошибка импорта", str(error))
 
     def open_google_maps(self, development_id: int | None = None):
@@ -1642,6 +1700,7 @@ class HouseCheckWindow(QMainWindow):
 
     def save_preferences(self):
         for key, slider in self.sliders.items(): self.db.set_preference(key, slider.value())
+        self.log("Профиль комфорта", ", ".join(f"{k}={s.value()}" for k, s in self.sliders.items() if s.value()), "Сохранён")
         toast(self, self.t("profile_saved"), "ok")
 
     # ---------- prompt export ----------
@@ -1667,7 +1726,7 @@ class HouseCheckWindow(QMainWindow):
     def save_notes(self):
         if not self.current_id: return
         item = self.db.get_development(self.current_id)
-        if item: item["notes"] = self.notes.toPlainText(); self.db.update_development(self.current_id, item); self.notes.document().setModified(False); toast(self, self.t("note_saved"), "ok")
+        if item: item["notes"] = self.notes.toPlainText(); self.db.update_development(self.current_id, item); self.log("Заметка", item["name"], item["notes"][:200]); self.notes.document().setModified(False); toast(self, self.t("note_saved"), "ok")
 
     # ---------- Google Places (логика сохранена) ----------
     def sync_google_reviews(self):
@@ -1684,7 +1743,13 @@ class HouseCheckWindow(QMainWindow):
         update = dict(item); update["google_place_id"] = place.get("id", ""); update["google_maps_url"] = place.get("googleMapsUri", item.get("google_maps_url", "")); update["address"] = place.get("formattedAddress", item.get("address", ""))
         if place.get("location"): update["lat"] = place["location"].get("latitude", item["lat"]); update["lng"] = place["location"].get("longitude", item["lng"])
         self.db.update_development(self.current_id, update); self.db.clear_reviews_for_source(self.current_id, "Google Maps")
-        for review in reviews: self.db.add_review(self.current_id, review["source"], review["rating"], review["author"], review["text"], review["published_at"])
+        skipped = 0
+        for review in reviews:
+            try:
+                self.db.add_review(self.current_id, review["source"], review["rating"], review["author"], review["text"], review["published_at"])
+            except ValueError:
+                skipped += 1  # отзыв без текста или без оценки не сохраняем
+        self.log("Google Places", item["name"], f"Загружено: {len(reviews) - skipped}, пропущено: {skipped}")
         self.render_detail(); toast(self, f"Google Places: загружено отзывов: {len(reviews)}", "ok")
 
     def google_reviews_failed(self, message: str):
@@ -1716,7 +1781,11 @@ class HouseCheckWindow(QMainWindow):
         ct = getattr(self, "_claude_thread", None)
         if ct and ct.isRunning():
             ct.quit(); ct.wait(1500)
-        self.db.close(); event.accept()
+        if getattr(self, "guard", None): self.guard.stop()
+        if not self._logging_out:
+            self.log("Выход", "", "Приложение закрыто")
+            self.db.close(); QApplication.quit()
+        event.accept()
 
 
 class _InputPill(QFrame):
@@ -1737,10 +1806,26 @@ def main():
     load_local_env()
     app = QApplication(sys.argv); app.setApplicationName("HouseCheck AI"); app.setFont(font(13))
     set_theme("light"); app.setStyleSheet(load_theme_stylesheet("light"))
+    app.setQuitOnLastWindowClosed(False)  # после «Выйти» снова показываем окно входа
     db = Database()
-    login = LoginDialog(db)
-    if login.exec() != QDialog.DialogCode.Accepted: return
-    window = HouseCheckWindow(db, login.user); window.show(); sys.exit(app.exec())
+    state = {"window": None, "lang": "ru"}
+
+    def start_session():
+        old = state["window"]
+        if old is not None:
+            state["lang"] = old.language
+            old.deleteLater()
+        set_theme("light"); app.setStyleSheet(load_theme_stylesheet("light"))
+        login = LoginDialog(db, state["lang"])
+        if login.exec() != QDialog.DialogCode.Accepted:
+            db.close(); app.quit(); return False
+        window = HouseCheckWindow(db, login.user, state["lang"])
+        window.logged_out.connect(lambda: QTimer.singleShot(0, start_session))
+        state["window"] = window; window.show()
+        return True
+
+    if not start_session(): return
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__": main()
